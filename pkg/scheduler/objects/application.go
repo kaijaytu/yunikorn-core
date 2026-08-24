@@ -115,17 +115,19 @@ type Application struct {
 	rejectedMessage      string                      // If the application is rejected, save the rejected message
 	stateLog             []*StateLogEntry            // state log for this application
 	placeholderData      map[string]*PlaceholderData // track placeholder and gang related info
-	askMaxPriority       int32                       // highest priority value of outstanding asks
+	askMaxPriority       int32                       // highest priority value of outstanding (pending) asks
+	pendingPriorities    map[int32]int               // count of pending (non-allocated) asks per priority value
 	hasPlaceholderAlloc  bool                        // Whether there is at least one allocated placeholder
 	runnableInQueue      bool                        // whether the application is runnable/schedulable in the queue. Default is true.
 	runnableByUserLimit  bool                        // whether the application is runnable/schedulable based on user/group quota. Default is true.
 	backoffDeadline      time.Time                   // no scheduling from this application until this deadline
 
-	rmEventHandler        handler.EventHandler
-	rmID                  string
-	terminatedCallback    func(appID string)
-	appEvents             *schedEvt.ApplicationEvents
-	sendStateChangeEvents bool // whether to send state-change events or not (simplifies testing)
+	rmEventHandler              handler.EventHandler
+	rmID                        string
+	terminatedCallback          func(appID string)
+	reservationReleasedCallback func(released int)
+	appEvents                   *schedEvt.ApplicationEvents
+	sendStateChangeEvents       bool // whether to send state-change events or not (simplifies testing)
 
 	locking.RWMutex
 }
@@ -154,6 +156,7 @@ func NewApplication(siApp *si.AddApplicationRequest, ugi security.UserGroup, eve
 		rejectedMessage:       "",
 		stateLog:              make([]*StateLogEntry, 0),
 		askMaxPriority:        configs.MinPriority,
+		pendingPriorities:     make(map[int32]int),
 		sortedRequests:        sortedRequests{},
 		sendStateChangeEvents: true,
 		runnableByUserLimit:   true,
@@ -483,7 +486,8 @@ func (sa *Application) timeoutPlaceholderProcessing() {
 			zap.Int("pending", len(pendingRelease)),
 			zap.Int("preempted", preempted),
 			zap.String("gang scheduling style", sa.gangSchedulingStyle))
-		sa.removeAsksInternal("", si.EventRecord_REQUEST_TIMEOUT)
+		released := sa.removeAsksInternal("", si.EventRecord_REQUEST_TIMEOUT)
+		sa.executeReservationReleasedCallback(released)
 		// trigger the release of the allocated placeholders: accounting updates when the release is done
 		sa.notifyRMAllocationReleased(toRelease, si.TerminationType_TIMEOUT, "releasing allocated placeholders on placeholder timeout")
 		// trigger the release of the pending placeholders: accounting has been done
@@ -595,6 +599,7 @@ func (sa *Application) removeAsksInternal(allocKey string, detail si.EventRecord
 		}
 		sa.requests = make(map[string]*Allocation)
 		sa.sortedRequests = sortedRequests{}
+		sa.pendingPriorities = make(map[int32]int)
 		sa.askMaxPriority = configs.MinPriority
 		sa.queue.UpdateApplicationPriority(sa.ApplicationID, sa.askMaxPriority)
 	} else {
@@ -610,13 +615,12 @@ func (sa *Application) removeAsksInternal(allocKey string, detail si.EventRecord
 				deltaPendingResource = ask.GetAllocatedResource()
 				sa.pending = resources.Sub(sa.pending, deltaPendingResource)
 				sa.pending.Prune()
+				// the removed ask was pending: drop it from the priority histogram
+				sa.removeFromPriorities(ask.GetPriority())
 			}
 			delete(sa.requests, allocKey)
 			sa.sortedRequests.remove(ask)
 			sa.appEvents.SendRemoveAskEvent(sa.ApplicationID, ask.allocationKey, ask.GetAllocatedResource(), detail)
-			if priority := ask.GetPriority(); priority >= sa.askMaxPriority {
-				sa.updateAskMaxPriority()
-			}
 		}
 	}
 	// clean up the queue pending resources
@@ -662,6 +666,9 @@ func (sa *Application) AddAllocationAsk(ask *Allocation) error {
 	var oldAskResource *resources.Resource = nil
 	if oldAsk := sa.requests[ask.GetAllocationKey()]; oldAsk != nil && !oldAsk.IsAllocated() {
 		oldAskResource = oldAsk.GetAllocatedResource().Clone()
+		// the old ask was pending and is being replaced: drop it from the priority histogram so the
+		// new ask's addAllocationAskInternal (via addToPriorities) nets correctly.
+		sa.removeFromPriorities(oldAsk.GetPriority())
 	}
 
 	// Check if we need to change state based on the ask added, there are two cases:
@@ -776,15 +783,68 @@ func (sa *Application) RecoverAllocationAsk(alloc *Allocation) {
 	}
 }
 
+// addToPriorities records that an ask at priority p just became pending (added, or
+// deallocated back to pending). Call with sa.Lock() held.
+func (sa *Application) addToPriorities(p int32) {
+	sa.pendingPriorities[p]++
+	if p > sa.askMaxPriority {
+		sa.setAskMaxPriority(p)
+	}
+}
+
+// removeFromPriorities records that a pending ask at priority p just left the pending set
+// (allocated, or removed). Call with sa.Lock() held.
+func (sa *Application) removeFromPriorities(p int32) {
+	// n is the count the band is left with. A band is removed as soon as it empties, so a band that
+	// is present always holds at least one ask - n < 0 therefore means there was no band at all,
+	// not a band that happened to be sitting at zero.
+	switch n := sa.pendingPriorities[p] - 1; {
+	case n < 0:
+		// nothing to decrement: an inc/dec pair was missed somewhere. Report it rather than
+		// absorbing it, because askMaxPriority is only correct while those pairs match.
+		log.Log(log.SchedApplication).DPanic("no pending priority band to decrement",
+			zap.String("appID", sa.ApplicationID),
+			zap.Int32("priority", p))
+	case n > 0:
+		// other pending asks remain at this priority, so the band survives and the maximum -
+		// whichever band it points at - cannot have moved.
+		sa.pendingPriorities[p] = n
+	default:
+		// that was the last pending ask at this priority, so the band goes away
+		delete(sa.pendingPriorities, p)
+		if p != sa.askMaxPriority {
+			// the band that got deleted was not the max priority, so we don't change the existing
+			// cached value
+			return
+		}
+		// the top band emptied, so the maximum has to be recomputed. This walks the bands, not the
+		// asks: O(distinct priorities in use), not O(number of asks). An empty map yields
+		// MinPriority, which is what the full rescan this replaced also produced with nothing
+		// pending.
+		newMax := configs.MinPriority
+		for band := range sa.pendingPriorities {
+			newMax = max(newMax, band)
+		}
+		sa.setAskMaxPriority(newMax)
+	}
+}
+
+// setAskMaxPriority updates askMaxPriority and only propagates to the queue when the value
+// actually changes. Call with sa.Lock() held.
+func (sa *Application) setAskMaxPriority(v int32) {
+	if v == sa.askMaxPriority {
+		return
+	}
+	sa.askMaxPriority = v
+	sa.queue.UpdateApplicationPriority(sa.ApplicationID, v)
+}
+
 func (sa *Application) addAllocationAskInternal(ask *Allocation) {
 	sa.requests[ask.GetAllocationKey()] = ask
 
-	// update app priority
-	allocated := ask.IsAllocated()
-	priority := ask.GetPriority()
-	if !allocated && priority > sa.askMaxPriority {
-		sa.askMaxPriority = priority
-		sa.queue.UpdateApplicationPriority(sa.ApplicationID, sa.askMaxPriority)
+	// update app priority: a recovered (already allocated) ask must never enter the pending histogram
+	if !ask.IsAllocated() {
+		sa.addToPriorities(ask.GetPriority())
 	}
 
 	if ask.IsPlaceholder() {
@@ -822,6 +882,10 @@ func (sa *Application) RollbackAllocation(allocKey string) (*resources.Resource,
 		return nil, fmt.Errorf("cannot rollback allocation %s: application %s is in state %s", allocKey, sa.ApplicationID, sa.CurrentState())
 	}
 
+	if sa.requests[allocKey] == nil {
+		return nil, fmt.Errorf("failed to locate ask with key %s for rollback", allocKey)
+	}
+
 	ask := sa.allocations[allocKey]
 	if ask == nil {
 		return nil, fmt.Errorf("failed to locate allocation with key %s for rollback", allocKey)
@@ -856,10 +920,8 @@ func (sa *Application) allocateAsk(ask *Allocation) (*resources.Resource, error)
 		return nil, fmt.Errorf("unable to allocate previously allocated ask %s on app %s", ask.GetAllocationKey(), sa.ApplicationID)
 	}
 
-	if ask.GetPriority() >= sa.askMaxPriority {
-		// recalculate downward
-		sa.updateAskMaxPriority()
-	}
+	// the ask just left the pending set
+	sa.removeFromPriorities(ask.GetPriority())
 
 	delta := ask.GetAllocatedResource()
 	sa.pending = resources.Sub(sa.pending, delta)
@@ -875,11 +937,19 @@ func (sa *Application) deallocateAsk(ask *Allocation) (*resources.Resource, erro
 		return nil, fmt.Errorf("unable to deallocate pending ask %s on app %s", ask.GetAllocationKey(), sa.ApplicationID)
 	}
 
-	askPriority := ask.GetPriority()
-	if askPriority > sa.askMaxPriority {
-		// increase app priority
-		sa.askMaxPriority = askPriority
-		sa.queue.UpdateApplicationPriority(sa.ApplicationID, askPriority)
+	// The ask returns to the pending set, but only if it still IS this application's ask: an ask that
+	// has already been dropped from sa.requests must not be counted again. That is reachable today:
+	// removeAsksInternal("") wipes sa.requests while leaving sa.allocations intact until the shim
+	// confirms the releases, and a release arriving in that window reaches RollbackAllocation, which
+	// finds the entry in sa.allocations and deallocates it. The identity comparison (not just a
+	// presence check) also covers a stale ask object that has since been replaced by a new ask under
+	// the same key.
+	// This matches the converged behaviour of the full rescan this change replaced:
+	// updateAskMaxPriority derived the max by scanning sa.requests, so an ask absent from sa.requests
+	// never influenced it. Without the guard that pre-existing accounting drift would turn into a
+	// permanent leak in the incremental histogram instead.
+	if sa.requests[ask.GetAllocationKey()] == ask {
+		sa.addToPriorities(ask.GetPriority())
 	}
 
 	delta := ask.GetAllocatedResource()
@@ -1082,15 +1152,17 @@ func (sa *Application) canReplace(request *Allocation) bool {
 func (sa *Application) tryAllocate(headRoom *resources.Resource, allowPreemption bool, preemptionDelay time.Duration, preemptAttemptsRemaining *int, nodeIterator func() NodeIterator, fullNodeIterator func() NodeIterator, getNodeFn func(string) *Node) *AllocationResult {
 	sa.Lock()
 	defer sa.Unlock()
-	if sa.sortedRequests == nil {
+	if len(sa.sortedRequests) == 0 {
 		return nil
 	}
 	// calculate the users' headroom, includes group check which requires the applicationID
 	userHeadroom := ugm.GetUserManager().Headroom(sa.queuePath, sa.ApplicationID, sa.user)
 	unschedulable := uint64(0)
+	// constant for the cycle: hoisted out of the loop below. Safe to call unconditionally here
+	// because the len check above guarantees at least one iteration would occur.
+	backoffThreshold := sa.queue.GetMaxAppUnschedAskBackoff()
 	// get all the requests from the app sorted in order
 	for _, request := range sa.sortedRequests {
-		backoffThreshold := sa.queue.GetMaxAppUnschedAskBackoff()
 		if backoffThreshold > 0 && unschedulable >= backoffThreshold {
 			log.Log(log.SchedApplication).Info("too many unschedulable asks in the application, waiting",
 				zap.String("application ID", sa.ApplicationID),
@@ -1225,33 +1297,50 @@ func (sa *Application) tryRequiredNode(request *Allocation, getNodeFn func(strin
 	return result
 }
 
+// unreserveForApp handles the lock-aware unreserve for a single reservation.
+// Uses the internal unlocked path when the reservation belongs to this app.
+func (sa *Application) unreserveForApp(res *reservation) int {
+	var num int
+	if sa.ApplicationID == res.appID {
+		num = sa.unReserveInternal(res)
+		sa.queue.UnReserve(sa.ApplicationID, num)
+	} else {
+		num = res.app.UnReserve(res.node, res.alloc)
+		res.app.GetQueue().UnReserve(res.app.ApplicationID, num)
+	}
+	if num > 0 {
+		log.Log(log.SchedApplication).Info("Reservation cancelled",
+			zap.String("triggeringAppID", sa.ApplicationID),
+			zap.String("reservingAppID", res.appID),
+			zap.String("reservingAllocationKey", res.allocKey),
+			zap.String("node", res.nodeID))
+	}
+	return num
+}
+
+// cancelMatchingReservations cancels reservations that match the predicate.
+// Returns the number of reservations released and the number remaining.
+func (sa *Application) cancelMatchingReservations(reservations []*reservation, shouldCancel func(*reservation) bool) (int, int) {
+	released := 0
+	remaining := len(reservations)
+	for _, res := range reservations {
+		if !shouldCancel(res) {
+			continue
+		}
+		num := sa.unreserveForApp(res)
+		released += num
+		remaining -= num
+	}
+	return released, remaining
+}
+
 // cancelReservations will cancel all non required node reservations for a node. The list of reservations passed in is
 // a copy of all reservations of a single node. This is called during the required node allocation cycle only.
 // The returned int value is used to update the partition counter of active reservations.
 func (sa *Application) cancelReservations(reservations []*reservation) int {
-	var released, num int
-	// un reserve all the apps that were reserved on the node
-	for _, res := range reservations {
-		// cleanup if the reservation does not have this node as a requirement
-		if res.alloc.requiredNode != "" {
-			continue
-		}
-		thisApp := res.app.ApplicationID == sa.ApplicationID
-		if thisApp {
-			num = sa.unReserveInternal(res)
-			sa.queue.UnReserve(sa.ApplicationID, num)
-		} else {
-			num = res.app.UnReserve(res.node, res.alloc)
-			res.app.GetQueue().UnReserve(res.app.ApplicationID, num)
-		}
-		log.Log(log.SchedApplication).Info("Cancelled reservation for required node allocation",
-			zap.String("triggered by appID", sa.ApplicationID),
-			zap.String("affected application ID", res.appID),
-			zap.String("affected allocationKey", res.allocKey),
-			zap.String("required node", res.nodeID),
-			zap.Int("reservations count", num))
-		released += num
-	}
+	released, _ := sa.cancelMatchingReservations(reservations, func(res *reservation) bool {
+		return res.alloc.requiredNode == ""
+	})
 	return released
 }
 
@@ -1541,10 +1630,8 @@ func (sa *Application) tryPreemption(headRoom *resources.Resource, preemptionDel
 		ask.LogAllocationFailure(common.PreemptionMaxAttemptsExhausted, true)
 		return nil, false
 	}
-	preemptor := NewPreemptor(sa, headRoom, preemptionDelay, ask, iterator, nodesTried)
-
 	// validate prerequisites for preemption of an ask and mark ask for preemption if successful
-	if !preemptor.CheckPreconditions() {
+	if !CheckPreconditions(ask, preemptionDelay) {
 		ask.LogAllocationFailure(common.PreemptionPreconditionsFailed, true)
 		return nil, false
 	}
@@ -1555,6 +1642,7 @@ func (sa *Application) tryPreemption(headRoom *resources.Resource, preemptionDel
 	defer metrics.GetSchedulerMetrics().ObserveTryPreemptionLatency(tryPreemptionStart)
 
 	// attempt preemption
+	preemptor := NewPreemptor(sa, headRoom, preemptionDelay, ask, iterator, nodesTried)
 	return preemptor.TryPreemption()
 }
 
@@ -2051,18 +2139,6 @@ func (sa *Application) removeAllocationInternal(allocationKey string, releaseTyp
 	return alloc
 }
 
-func (sa *Application) updateAskMaxPriority() {
-	value := configs.MinPriority
-	for _, v := range sa.requests {
-		if v.IsAllocated() {
-			continue
-		}
-		value = max(value, v.GetPriority())
-	}
-	sa.askMaxPriority = value
-	sa.queue.UpdateApplicationPriority(sa.ApplicationID, value)
-}
-
 func (sa *Application) hasZeroAllocations() bool {
 	return resources.IsZero(sa.pending) && resources.IsZero(sa.allocatedResource)
 }
@@ -2096,9 +2172,14 @@ func (sa *Application) RemoveAllAllocations() []*Allocation {
 	sa.allocatedResource = resources.NewResource()
 	sa.allocatedPlaceholder = resources.NewResource()
 	sa.allocations = make(map[string]*Allocation)
+
 	// When the resource trackers are zero we should not expect anything to come in later.
 	if resources.IsZero(sa.pending) {
-		if err := sa.HandleApplicationEvent(CompleteApplication); err != nil {
+		event := CompleteApplication
+		if sa.IsFailing() {
+			event = FailApplication
+		}
+		if err := sa.HandleApplicationEvent(event); err != nil {
 			log.Log(log.SchedApplication).Warn("Application state not changed to Completing while removing all allocations",
 				zap.String("currentState", sa.CurrentState()),
 				zap.Error(err))
@@ -2159,6 +2240,18 @@ func (sa *Application) SetTerminatedCallback(callback func(appID string)) {
 func (sa *Application) executeTerminatedCallback() {
 	if sa.terminatedCallback != nil {
 		go sa.terminatedCallback(sa.ApplicationID)
+	}
+}
+
+func (sa *Application) SetReservationReleasedCallback(callback func(released int)) {
+	sa.Lock()
+	defer sa.Unlock()
+	sa.reservationReleasedCallback = callback
+}
+
+func (sa *Application) executeReservationReleasedCallback(released int) {
+	if released > 0 && sa.reservationReleasedCallback != nil {
+		go sa.reservationReleasedCallback(released)
 	}
 }
 
@@ -2241,6 +2334,10 @@ func (sa *Application) GetAskMaxPriority() int32 {
 func (sa *Application) cleanupAsks() {
 	sa.requests = make(map[string]*Allocation)
 	sa.sortedRequests = nil
+	// a Failed app can still hold pending asks: reset the histogram or the consistency check would
+	// fire on terminal apps.
+	sa.pendingPriorities = make(map[int32]int)
+	sa.askMaxPriority = configs.MinPriority
 }
 
 func (sa *Application) cleanupTrackedResource() {

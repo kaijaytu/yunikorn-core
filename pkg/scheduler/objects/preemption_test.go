@@ -135,43 +135,44 @@ func TestCheckPreconditions(t *testing.T) {
 	ask.createTime = time.Now().Add(-1 * time.Minute)
 	err = app.AddAllocationAsk(ask)
 	assert.NilError(t, err)
-	preemptor := NewPreemptor(app, resources.NewResource(), 30*time.Second, ask, iterator(), false)
+	// the checks run without a preemptor: they only need the ask and the delay
+	preemptionDelay := 30 * time.Second
 
 	// success case
-	assert.Assert(t, preemptor.CheckPreconditions(), "preconditions failed")
+	assert.Assert(t, CheckPreconditions(ask, preemptionDelay), "preconditions failed")
 	ask.preemptCheckTime = time.Now().Add(-1 * time.Minute)
 
 	// verify ask which opted-out of preempting others is disqualified
 	ask.allowPreemptOther = false
-	assert.Assert(t, !preemptor.CheckPreconditions(), "preconditions succeeded when ask doesn't allow preempt other")
+	assert.Assert(t, !CheckPreconditions(ask, preemptionDelay), "preconditions succeeded when ask doesn't allow preempt other")
 	ask.allowPreemptOther = true
-	assert.Assert(t, preemptor.CheckPreconditions(), "preconditions failed")
+	assert.Assert(t, CheckPreconditions(ask, preemptionDelay), "preconditions failed")
 	ask.preemptCheckTime = time.Now().Add(-1 * time.Minute)
 
 	// verify previously triggered preemption disqualifies ask
 	ask.MarkTriggeredPreemption()
-	assert.Assert(t, !preemptor.CheckPreconditions(), "preconditions succeeded when ask has already triggered preemption")
+	assert.Assert(t, !CheckPreconditions(ask, preemptionDelay), "preconditions succeeded when ask has already triggered preemption")
 	ask.preemptionTriggered = false
-	assert.Assert(t, preemptor.CheckPreconditions(), "preconditions failed")
+	assert.Assert(t, CheckPreconditions(ask, preemptionDelay), "preconditions failed")
 	ask.preemptCheckTime = time.Now().Add(-1 * time.Minute)
 
 	// verify that ask requiring a specific node is disqualified
 	ask.SetRequiredNode("node1")
-	assert.Assert(t, !preemptor.CheckPreconditions(), "preconditions succeeded with ask requiring a specific node")
+	assert.Assert(t, !CheckPreconditions(ask, preemptionDelay), "preconditions succeeded with ask requiring a specific node")
 	ask.SetRequiredNode("")
-	assert.Assert(t, preemptor.CheckPreconditions(), "preconditions failed")
+	assert.Assert(t, CheckPreconditions(ask, preemptionDelay), "preconditions failed")
 	ask.preemptCheckTime = time.Now().Add(-1 * time.Minute)
 
 	// verify that recently created ask is disqualified
 	ask.createTime = time.Now()
-	assert.Assert(t, !preemptor.CheckPreconditions(), "preconditions succeeded with newly-created ask")
+	assert.Assert(t, !CheckPreconditions(ask, preemptionDelay), "preconditions succeeded with newly-created ask")
 	ask.createTime = time.Now().Add(-1 * time.Minute)
-	assert.Assert(t, preemptor.CheckPreconditions(), "preconditions failed")
+	assert.Assert(t, CheckPreconditions(ask, preemptionDelay), "preconditions failed")
 	ask.preemptCheckTime = time.Now().Add(-1 * time.Minute)
 
 	// verify that recently checked ask is disqualified
 	ask.preemptCheckTime = time.Now()
-	assert.Assert(t, !preemptor.CheckPreconditions(), "preconditions succeeded with recently tried ask")
+	assert.Assert(t, !CheckPreconditions(ask, preemptionDelay), "preconditions succeeded with recently tried ask")
 	getNode := func(nodeID string) *Node {
 		return node
 	}
@@ -180,8 +181,8 @@ func TestCheckPreconditions(t *testing.T) {
 	assert.Check(t, result == nil, "unexpected result")
 	assertAllocationLog(t, ask, []string{common.PreemptionPreconditionsFailed, common.PreemptionDoesNotHelp})
 	ask.preemptCheckTime = time.Now().Add(-1 * time.Minute)
-	assert.Assert(t, preemptor.CheckPreconditions(), "preconditions failed")
-	assert.Assert(t, !preemptor.CheckPreconditions(), "preconditions succeeded on successive run")
+	assert.Assert(t, CheckPreconditions(ask, preemptionDelay), "preconditions failed")
+	assert.Assert(t, !CheckPreconditions(ask, preemptionDelay), "preconditions succeeded on successive run")
 }
 
 func TestCheckPreemptionQueueGuarantees(t *testing.T) {
@@ -2267,6 +2268,14 @@ func Test_PreemptForAppOnReservedNode(t *testing.T) {
 	app.SetQueue(childQ)
 	childQ.AddApplication(app)
 
+	// the stale reservation below is cancelled while preemption builds its working state, and this run
+	// does not preempt anything. The release must still be reported so the partition level counter can
+	// be corrected. The callback runs on its own go routine, so collect the value over a channel.
+	releasedCh := make(chan int, 2)
+	app.SetReservationReleasedCallback(func(released int) {
+		releasedCh <- released
+	})
+
 	// (1) no-priority ask, RESERVED on node1 ask does not fit in free node resources
 	askLow := newAllocationAsk(aKey, appID1, resources.NewResourceFromMap(map[string]resources.Quantity{"first": 5}))
 	// must be more than wait timeout (default 60min) + delay (default 2sec) ago
@@ -2292,4 +2301,95 @@ func Test_PreemptForAppOnReservedNode(t *testing.T) {
 	result := app.tryAllocate(resources.NewResourceFromMap(map[string]resources.Quantity{"first": 10}), true, 1*time.Second, &remaining, iterator, iterator, getNode)
 	assert.Assert(t, result != nil, "expected and allocation result back")
 	assert.Equal(t, result.ResultType, Reserved, "expected result type to be Reserved")
+
+	// no victims exist on the node so the preemption itself never runs: the high priority ask is not
+	// marked, and the reservation that was returned belongs to the low priority ask that was released above
+	assert.Check(t, !askHigh.HasTriggeredPreemption(), "preemption should not have been triggered")
+	assert.Equal(t, result.Request.GetAllocationKey(), aKey, "expected the released ask to be reserved again")
+	select {
+	case released := <-releasedCh:
+		assert.Equal(t, released, 1, "expected 1 released reservation to be reported")
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the released reservation to be reported")
+	}
+}
+
+// Test_PreemptReleasesReservationsOnSuccess checks the reservation release accounting for the run that
+// does preempt. A stale low priority reservation is cancelled while the working state is built, and the
+// preemption then succeeds on that same node. The release must be reported exactly once, and it must not
+// also be carried on the allocation result: the partition decrements that separately.
+func Test_PreemptReleasesReservationsOnSuccess(t *testing.T) {
+	appQueueMapping := NewAppQueueMapping()
+	node1 := newNode(nodeID1, map[string]resources.Quantity{"first": 5, "pods": 1})
+	node2 := newNode(nodeID2, map[string]resources.Quantity{"first": 5, "pods": 1})
+	iterator := getNodeIteratorFn(node1, node2)
+	rootQ, err := createRootQueue(map[string]string{"first": "10", "pods": "2"})
+	assert.NilError(t, err)
+	parentQ, err := createManagedQueueGuaranteed(rootQ, "parent", true, map[string]string{"first": "20"}, map[string]string{"first": "10"}, appQueueMapping)
+	assert.NilError(t, err)
+	childQ1, err := createManagedQueueGuaranteed(parentQ, "child1", false, map[string]string{"first": "10"}, map[string]string{"first": "5"}, appQueueMapping)
+	assert.NilError(t, err)
+	childQ2, err := createManagedQueueGuaranteed(parentQ, "child2", false, map[string]string{"first": "10"}, map[string]string{"first": "5"}, appQueueMapping)
+	assert.NilError(t, err)
+
+	alloc1, alloc2, err := creatApp1(childQ1, node1, node2, map[string]resources.Quantity{"first": 5, "pods": 1}, appQueueMapping)
+	assert.NilError(t, err)
+
+	app2 := newApplication(appID2, "default", childQ2.QueuePath)
+	app2.SetQueue(childQ2)
+	childQ2.AddApplication(app2)
+	appQueueMapping.AddAppQueueMapping(app2.ApplicationID, childQ2)
+
+	releasedCh := make(chan int, 2)
+	app2.SetReservationReleasedCallback(func(released int) {
+		releasedCh <- released
+	})
+
+	// stale low priority ask holding a reservation on the node the preemption will pick
+	askReserved := newAllocationAsk("alloc4", appID2, resources.NewResourceFromMap(map[string]resources.Quantity{"first": 5, "pods": 1}))
+	askReserved.createTime = time.Now().Add(-90 * time.Minute)
+	assert.NilError(t, app2.AddAllocationAsk(askReserved), "ask addition to app should not have failed")
+	assert.NilError(t, app2.Reserve(node2, askReserved), "reservation on node should not have failed")
+	nodeRes := node2.GetReservations()
+	assert.Equal(t, len(nodeRes), 1, "expected 1 reservation")
+	// must be older than the reservation wait timeout for the cancellation to trigger
+	nodeRes[0].createTime = nodeRes[0].createTime.Add(-90 * time.Minute)
+
+	// higher priority ask that drives the preemption
+	ask3 := newAllocationAskPriority("alloc3", appID2, resources.NewResourceFromMap(map[string]resources.Quantity{"first": 5, "pods": 1}), 100)
+	assert.NilError(t, app2.AddAllocationAsk(ask3), "ask addition to app should not have failed")
+
+	headRoom := resources.NewResourceFromMap(map[string]resources.Quantity{"first": 10, "pods": 3})
+	preemptor := NewPreemptor(app2, headRoom, 30*time.Second, ask3, iterator(), false)
+
+	// register predicate handler
+	preemptions := []mock.Preemption{
+		mock.NewPreemption(true, "alloc3", nodeID2, []string{"alloc2"}, 0, 0),
+	}
+	plugin := mock.NewPreemptionPredicatePlugin(nil, nil, preemptions)
+	plugins.RegisterSchedulerPlugin(plugin)
+	defer plugins.UnregisterSchedulerPlugins()
+
+	result, ok := preemptor.TryPreemption()
+	assert.Assert(t, result != nil, "no result")
+	assert.Assert(t, ok, "no victims found")
+	assert.Equal(t, result.NodeID, nodeID2, "wrong node")
+	assert.Check(t, !alloc1.IsPreempted(), "alloc1 preempted")
+	assert.Check(t, alloc2.IsPreempted(), "alloc2 not preempted")
+	// the release is reported over the callback, not on the result: the partition applies both and would
+	// otherwise decrement twice for the same cancellation
+	assert.Equal(t, result.CancelledReservations, 0, "release must not be carried on the allocation result")
+	assert.Equal(t, len(node2.GetReservations()), 0, "reservation should have been cancelled")
+
+	select {
+	case released := <-releasedCh:
+		assert.Equal(t, released, 1, "expected 1 released reservation to be reported")
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the released reservation to be reported")
+	}
+	select {
+	case extra := <-releasedCh:
+		t.Fatalf("released reservation reported twice, second report was %d", extra)
+	case <-time.After(100 * time.Millisecond):
+	}
 }

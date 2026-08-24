@@ -89,36 +89,36 @@ func NewPreemptor(application *Application, headRoom *resources.Resource, preemp
 
 // CheckPreconditions performs simple sanity checks designed to determine if preemption should be attempted
 // for an ask. If checks succeed, updates the ask preemption check time.
-func (p *Preemptor) CheckPreconditions() bool {
+func CheckPreconditions(ask *Allocation, preemptionDelay time.Duration) bool {
 	now := time.Now()
 
 	// skip if ask is not allowed to preempt other tasks
-	if !p.ask.IsAllowPreemptOther() {
+	if !ask.IsAllowPreemptOther() {
 		return false
 	}
 
 	// skip if ask has previously triggered preemption
-	if p.ask.HasTriggeredPreemption() {
+	if ask.HasTriggeredPreemption() {
 		return false
 	}
 
 	// skip if ask requires a specific node (this should be handled by required node preemption algorithm)
-	if p.ask.GetRequiredNode() != "" {
+	if ask.GetRequiredNode() != "" {
 		return false
 	}
 
 	// skip if preemption delay has not yet passed
-	if now.Before(p.ask.GetCreateTime().Add(p.preemptionDelay)) {
+	if now.Before(ask.GetCreateTime().Add(preemptionDelay)) {
 		return false
 	}
 
 	// skip if attempt frequency hasn't been reached again
-	if now.Before(p.ask.GetPreemptCheckTime().Add(preemptAttemptFrequency)) {
+	if now.Before(ask.GetPreemptCheckTime().Add(preemptAttemptFrequency)) {
 		return false
 	}
 
 	// mark this ask as having been checked recently to avoid doing extra work in the next scheduling cycle
-	p.ask.UpdatePreemptCheckTime()
+	ask.UpdatePreemptCheckTime()
 
 	return true
 }
@@ -165,40 +165,21 @@ func (p *Preemptor) initWorkingState() int {
 	p.iterator.ForEachNode(func(node *Node) bool {
 		isReserved := false
 		if node.IsReserved() && !node.isReservedForAllocation(p.ask.GetAllocationKey()) {
-			leftCount := 0
-			for _, res := range node.GetReservations() {
-				leftCount++
-				// Is Allocation daemon set?
-				// Has this allocation already triggered preemption?
+			askPriority := p.ask.priority
+			released, remaining := p.application.cancelMatchingReservations(node.GetReservations(), func(res *reservation) bool {
 				if res.alloc.requiredNode != "" || res.alloc.HasTriggeredPreemption() {
-					continue
+					return false
 				}
-				// Cancel reservation based on its priority and waiting time in reservation queue
-				if res.alloc.GetPriority() < p.ask.priority && time.Since(res.createTime) > reservationWaitTimeout {
-					log.Log(log.SchedPreemption).Info("Cancelling reservation to consider node for preemption",
-						zap.String("triggeringAppID", p.application.ApplicationID),
-						zap.String("triggeringAllocationKey", p.ask.allocationKey),
-						zap.String("reservingAppID", res.appID),
-						zap.String("reservingAllocationKey", res.allocKey),
-						zap.String("node", node.NodeID))
-					num := 0
-					if p.application.ApplicationID == res.appID {
-						num = res.app.unReserveInternal(res)
-						res.app.queue.UnReserve(res.app.ApplicationID, num)
-					} else {
-						num = res.app.UnReserve(res.node, res.alloc)
-						res.app.GetQueue().UnReserve(res.app.ApplicationID, num)
-					}
-					totalReservationCancel += num
-					leftCount -= num
-				}
-			}
-			log.Log(log.SchedPreemption).Debug("Reservations left on node are cleanup",
+				return res.alloc.GetPriority() < askPriority && time.Since(res.createTime) > reservationWaitTimeout
+			})
+			totalReservationCancel += released
+			log.Log(log.SchedPreemption).Debug("Reservations left on node after cleanup",
 				zap.String("triggeringAppID", p.application.ApplicationID),
 				zap.String("triggeringAllocationKey", p.ask.allocationKey),
 				zap.String("node", node.NodeID),
-				zap.Int("leftCount", leftCount))
-			isReserved = leftCount > 0
+				zap.Int("released", released),
+				zap.Int("remaining", remaining))
+			isReserved = remaining > 0
 		}
 		if !node.IsSchedulable() || isReserved || !node.FitInNode(p.ask.GetAllocatedResource()) {
 			// node is not available, remove any potential victims from consideration
@@ -609,7 +590,11 @@ func (p *Preemptor) TryPreemption() (*AllocationResult, bool) {
 	}
 
 	// ensure required data structures are populated
-	p.initWorkingState()
+	// building the data structures can cancel reservations on the nodes we walk. Those reservations are
+	// gone whether or not the preemption below succeeds, so the release must be accounted for here
+	// instead of on the return paths: all but one of them bail out without an allocation result.
+	released := p.initWorkingState()
+	p.application.executeReservationReleasedCallback(released)
 
 	// try to find a node to schedule on and victims to preempt
 	nodeID, victims, ok := p.tryNodes()

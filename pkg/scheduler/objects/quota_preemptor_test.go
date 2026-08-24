@@ -160,7 +160,9 @@ func TestQuotaChangeTryPreemption(t *testing.T) {
 	notSuitableVictims := make([]*Allocation, 0)
 	oversizedVictims := make([]*Allocation, 0)
 	overflowVictims := make([]*Allocation, 0)
+	overflowVictims1 := make([]*Allocation, 0)
 	shortfallVictims := make([]*Allocation, 0)
+	shortfallVictims1 := make([]*Allocation, 0)
 
 	suitableVictims = append(suitableVictims, createVictim(t, "ask1", node, 5, resources.NewResourceFromMap(map[string]resources.Quantity{"first": 10})))
 	// ask2 uses {first:8} (smaller than ask1's {first:10}) so it is deterministically sorted first and preempted
@@ -173,10 +175,19 @@ func TestQuotaChangeTryPreemption(t *testing.T) {
 	overflowVictims = append(overflowVictims, createVictim(t, "ask41", node, 2, resources.NewResourceFromMap(map[string]resources.Quantity{"first": 6})))
 	overflowVictims = append(overflowVictims, createVictim(t, "ask42", node, 1, resources.NewResourceFromMap(map[string]resources.Quantity{"first": 9})))
 
+	overflowVictims1 = append(overflowVictims1, createVictim(t, "ask4_1", node, 3, resources.NewResourceFromMap(map[string]resources.Quantity{"first": 5})))
+	overflowVictims1 = append(overflowVictims1, createVictim(t, "ask41_1", node, 2, resources.NewResourceFromMap(map[string]resources.Quantity{"first": 6})))
+	overflowVictims1 = append(overflowVictims1, createVictim(t, "ask42_1", node, 1, resources.NewResourceFromMap(map[string]resources.Quantity{"first": 9})))
+
 	shortfallVictims = append(shortfallVictims, createVictim(t, "ask5", node, 4, resources.NewResourceFromMap(map[string]resources.Quantity{"first": 5})))
 	shortfallVictims = append(shortfallVictims, createVictim(t, "ask51", node, 3, resources.NewResourceFromMap(map[string]resources.Quantity{"first": 6})))
 	shortfallVictims = append(shortfallVictims, createVictim(t, "ask52", node, 2, resources.NewResourceFromMap(map[string]resources.Quantity{"first": 3})))
 	shortfallVictims = append(shortfallVictims, createVictim(t, "ask53", node, 1, resources.NewResourceFromMap(map[string]resources.Quantity{"first": 4})))
+
+	shortfallVictims1 = append(shortfallVictims1, createVictim(t, "ask5_1", node, 4, resources.NewResourceFromMap(map[string]resources.Quantity{"first": 5})))
+	shortfallVictims1 = append(shortfallVictims1, createVictim(t, "ask51_1", node, 3, resources.NewResourceFromMap(map[string]resources.Quantity{"first": 6})))
+	shortfallVictims1 = append(shortfallVictims1, createVictim(t, "ask52_1", node, 2, resources.NewResourceFromMap(map[string]resources.Quantity{"first": 3})))
+	shortfallVictims1 = append(shortfallVictims1, createVictim(t, "ask53_1", node, 1, resources.NewResourceFromMap(map[string]resources.Quantity{"first": 4})))
 
 	notSuitableVictims = append(notSuitableVictims, createVictim(t, "ask6", node, 3, resources.NewResourceFromMap(map[string]resources.Quantity{"first": 11})))
 
@@ -207,9 +218,9 @@ func TestQuotaChangeTryPreemption(t *testing.T) {
 		{"victims available but none is suitable ", leaf, oldMax, newMax, nil, resources.NewResourceFromMap(map[string]resources.Quantity{"first": 1}), notSuitableVictims, nil, 1, []string{}},
 		{"skip over sized victims", leaf, oldMax, newMax, nil, preemptable, oversizedVictims, resources.NewResourceFromMap(map[string]resources.Quantity{"first": 9}), 2, []string{"ask21"}},
 		{"guaranteed not set", leaf, oldMax, newMax, nil, preemptable, overflowVictims, resources.NewResourceFromMap(map[string]resources.Quantity{"first": 5}), 3, []string{"ask4"}},
-		{"guaranteed set but lower than max", leaf, oldMax, newMax, lowerGuaranteed, preemptable, overflowVictims, resources.NewResourceFromMap(map[string]resources.Quantity{"first": 5}), 3, []string{"ask4"}},
+		{"guaranteed set but lower than max", leaf, oldMax, newMax, lowerGuaranteed, preemptable, overflowVictims1, resources.NewResourceFromMap(map[string]resources.Quantity{"first": 5}), 3, []string{"ask4_1"}},
 		{"best effort - guaranteed set and equals max", leaf, oldMax, newMax, guaranteed, bestEffortPreemptable, shortfallVictims, bestEffortClaimedResource, 4, []string{"ask52", "ask53"}},
-		{"best effort - guaranteed set, max not set earlier but now", leaf, nil, newMax, guaranteed, bestEffortPreemptable, shortfallVictims, bestEffortClaimedResource, 4, []string{"ask52", "ask53"}},
+		{"best effort - guaranteed set, max not set earlier but now", leaf, nil, newMax, guaranteed, bestEffortPreemptable, shortfallVictims1, bestEffortClaimedResource, 4, []string{"ask52_1", "ask53_1"}},
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -246,24 +257,40 @@ func TestQuotaChangeTryPreemptionWithDifferentResTypes(t *testing.T) {
 		NodeID:     "node",
 		Attributes: nil,
 		SchedulableResource: &si.Resource{
-			Resources: map[string]*si.Quantity{"first": {Value: 100}, "second": {Value: 200}},
+			Resources: map[string]*si.Quantity{"first": {Value: 200}, "second": {Value: 200}},
 		},
 	})
 
-	suitableVictims := make([]*Allocation, 0)
-	overflowVictims := make([]*Allocation, 0)
-	oversizedVictims := make([]*Allocation, 0)
-
-	suitableVictims = append(suitableVictims, createVictim(t, "ask1", node, 5, resources.NewResourceFromMap(map[string]resources.Quantity{"first": 10, "second": 10})))
-	// ask2 uses {first:9, second:9} (smaller than ask1 in both dimensions) to ensure deterministic sort order
-	suitableVictims = append(suitableVictims, createVictim(t, "ask2", node, 4, resources.NewResourceFromMap(map[string]resources.Quantity{"first": 9, "second": 9})))
-
-	oversizedVictims = append(oversizedVictims, createVictim(t, "ask21", node, 4, resources.NewResourceFromMap(map[string]resources.Quantity{"first": 9, "second": 10})))
-	oversizedVictims = append(oversizedVictims, createVictim(t, "ask3", node, 3, resources.NewResourceFromMap(map[string]resources.Quantity{"first": 11, "second": 10})))
-
-	overflowVictims = append(overflowVictims, createVictim(t, "ask4", node, 3, resources.NewResourceFromMap(map[string]resources.Quantity{"first": 5, "second": 10})))
-	overflowVictims = append(overflowVictims, createVictim(t, "ask41", node, 2, resources.NewResourceFromMap(map[string]resources.Quantity{"first": 6, "second": 10})))
-	overflowVictims = append(overflowVictims, createVictim(t, "ask42", node, 1, resources.NewResourceFromMap(map[string]resources.Quantity{"first": 9, "second": 10})))
+	suitableVictims := []*Allocation{
+		createVictim(t, "ask1", node, 5, resources.NewResourceFromMap(map[string]resources.Quantity{"first": 10, "second": 10})),
+		// ask2 uses {first:9, second:9} (smaller than ask1 in both dimensions) to ensure deterministic sort order
+		createVictim(t, "ask2", node, 4, resources.NewResourceFromMap(map[string]resources.Quantity{"first": 9, "second": 9})),
+	}
+	suitableVictims1 := []*Allocation{
+		createVictim(t, "ask1_1", node, 5, resources.NewResourceFromMap(map[string]resources.Quantity{"first": 10, "second": 10})),
+		createVictim(t, "ask2_1", node, 4, resources.NewResourceFromMap(map[string]resources.Quantity{"first": 9, "second": 9})),
+	}
+	suitableVictims2 := []*Allocation{
+		createVictim(t, "ask1_2", node, 5, resources.NewResourceFromMap(map[string]resources.Quantity{"first": 10, "second": 10})),
+		createVictim(t, "ask2_2", node, 4, resources.NewResourceFromMap(map[string]resources.Quantity{"first": 9, "second": 9})),
+	}
+	suitableVictims3 := []*Allocation{
+		createVictim(t, "ask1_3", node, 5, resources.NewResourceFromMap(map[string]resources.Quantity{"first": 10, "second": 10})),
+		createVictim(t, "ask2_3", node, 4, resources.NewResourceFromMap(map[string]resources.Quantity{"first": 9, "second": 9})),
+	}
+	suitableVictims4 := []*Allocation{
+		createVictim(t, "ask1_4", node, 5, resources.NewResourceFromMap(map[string]resources.Quantity{"first": 10, "second": 10})),
+		createVictim(t, "ask2_4", node, 4, resources.NewResourceFromMap(map[string]resources.Quantity{"first": 9, "second": 9})),
+	}
+	oversizedVictims := []*Allocation{
+		createVictim(t, "ask21", node, 4, resources.NewResourceFromMap(map[string]resources.Quantity{"first": 9, "second": 10})),
+		createVictim(t, "ask3", node, 3, resources.NewResourceFromMap(map[string]resources.Quantity{"first": 11, "second": 10})),
+	}
+	overflowVictims := []*Allocation{
+		createVictim(t, "ask4", node, 3, resources.NewResourceFromMap(map[string]resources.Quantity{"first": 5, "second": 10})),
+		createVictim(t, "ask41", node, 2, resources.NewResourceFromMap(map[string]resources.Quantity{"first": 6, "second": 10})),
+		createVictim(t, "ask42", node, 1, resources.NewResourceFromMap(map[string]resources.Quantity{"first": 9, "second": 10})),
+	}
 
 	oldMax := resources.NewResourceFromMap(map[string]resources.Quantity{"first": 20})
 	newMax := resources.NewResourceFromMap(map[string]resources.Quantity{"first": 10})
@@ -298,22 +325,22 @@ func TestQuotaChangeTryPreemptionWithDifferentResTypes(t *testing.T) {
 		},
 		{"suitable victims available with extra resource types other than defined in max", leaf, nil, newMax, nil,
 			[]test{
-				{suitableVictims, 2, []string{"ask2"}},
+				{suitableVictims1, 2, []string{"ask2_1"}},
 			},
 		},
 		{"suitable victims available with extra resource types other than defined in guaranteed", leaf, nil, newMax, lowerGuaranteed,
 			[]test{
-				{suitableVictims, 2, []string{"ask2"}},
+				{suitableVictims2, 2, []string{"ask2_2"}},
 			},
 		},
 		{"suitable victims available - different res types, adding new res type in max", leaf, oldMax, newMaxWithNewResTypes, nil,
 			[]test{
-				{suitableVictims, 2, []string{"ask2"}},
+				{suitableVictims3, 2, []string{"ask2_3"}},
 			},
 		},
 		{"suitable victims available - different res types, removing existing res type from max", leaf, oldMax, newMaxWithRemovedResTypes, nil,
 			[]test{
-				{suitableVictims, 2, []string{"ask2"}},
+				{suitableVictims4, 2, []string{"ask2_4"}},
 			},
 		},
 		{"overflow victims available with extra resource types other than defined in guaranteed and vice versa", leaf, oldMax, newMax, lowerGuaranteedWithNewResTypes,
@@ -570,7 +597,8 @@ func TestQuotaChangeTryPreemptionForParentQueue(t *testing.T) {
 	}{
 		// claimed = ask1(9)+ask2(10) + ask4(9) + ask6(8)+ask7(9)+ask8(10)+ask9(11)+ask10(12) + ask11(9)+ask12(10)+ask13(11) = 19+9+50+30 = 108
 		{"Guaranteed set on one side of queue hierarchy - suitable victims available", parent, oldMax, newMax, leafGVictims, resources.NewResourceFromMap(map[string]resources.Quantity{"first": 108}), 13, []string{"ask1", "ask2", "ask4", "ask6", "ask7", "ask8", "ask9", "ask10", "ask11", "ask12", "ask13"}},
-		{"Guaranteed set on one side of queue hierarchy - victims available but none suitable", parent, oldMax, newMax, leafGNotSuitableVictims, resources.NewResourceFromMap(map[string]resources.Quantity{"first": 110}), 1, []string{}},
+		// no victim fits the budget, so nothing is claimed even though one candidate is selected
+		{"Guaranteed set on one side of queue hierarchy - victims available but none suitable", parent, oldMax, newMax, leafGNotSuitableVictims, resources.NewResource(), 1, []string{}},
 		// claimed = ask1(9)+ask2(10) + ask4(9) + ask6(8)+ask7(9)+ask8(10)+ask9(11) + ask11(9)+ask12(10) = 19+9+38+19 = 85
 		{"Guaranteed set not set on any queue - suitable victims available", parent1, oldMax, newMax, leafVictims, resources.NewResourceFromMap(map[string]resources.Quantity{"first": 85}), 14, []string{"ask1", "ask2", "ask4", "ask6", "ask7", "ask8", "ask9", "ask11", "ask12"}},
 		// each leaf preempts the smaller victim (ask_even = {first:12}), claimed = 5 × 12 = 60
@@ -594,7 +622,7 @@ func TestQuotaChangeTryPreemptionForParentQueue(t *testing.T) {
 			}
 			assertPreemptedAllocationKeys(t, allAllocs, tc.preemptedKeys)
 			time.Sleep(500 * time.Millisecond)
-			assertQuotaPreemptionEvent(t, len(tc.preemptedKeys), "Quota Preemption results summary: preemptable resources: "+resources.Multiply(preemptableResource, -1).String()+", claimed resources: "+tc.claimedResources.String()+", selected victims: "+strconv.Itoa(tc.totalVictims)+", preempted victims: "+strconv.Itoa(len(tc.preemptedKeys)), eventSystem.Store.CollectEvents())
+			assertQuotaPreemptionEvent(t, tc.totalVictims, "Quota Preemption results summary: preemptable resources: "+resources.Multiply(preemptableResource, -1).String()+", claimed resources: "+tc.claimedResources.String()+", selected victims: "+strconv.Itoa(tc.totalVictims)+", preempted victims: "+strconv.Itoa(len(tc.preemptedKeys)), eventSystem.Store.CollectEvents())
 			for _, v := range tc.victims {
 				removeAllocationAsks(node, v)
 			}
@@ -624,9 +652,9 @@ func assertPreemptedAllocationKeys(t *testing.T, allocations []*Allocation, expe
 	}
 }
 
-func assertQuotaPreemptionEvent(t *testing.T, victims int, results string, records []*si.EventRecord) {
+func assertQuotaPreemptionEvent(t *testing.T, selectedVictims int, results string, records []*si.EventRecord) {
 	recordsLen := len(records)
-	if victims > 0 {
+	if selectedVictims > 0 {
 		assert.Equal(t, si.EventRecord_QUEUE, records[recordsLen-1].Type)
 		assert.Equal(t, si.EventRecord_SET, records[recordsLen-1].EventChangeType)
 		assert.Equal(t, si.EventRecord_QUEUE_PREEMPTION, records[recordsLen-1].EventChangeDetail)
@@ -685,9 +713,9 @@ func createQueueSetups(t *testing.T, parent *Queue, leafResG configs.Resources, 
 }
 
 func createVictim(t *testing.T, allocKey string, node *Node, adjustment int, allocRes *resources.Resource) *Allocation {
-	createTime := time.Now()
+	baseTime := time.Now().Truncate(time.Hour).Add(30 * time.Minute)
 	allocation := createAllocation(allocKey, "app1", node.NodeID, true, false, 10, false, allocRes)
-	allocation.createTime = createTime.Add(-time.Minute * time.Duration(adjustment))
+	allocation.createTime = baseTime.Add(-time.Minute * time.Duration(adjustment))
 	assert.Assert(t, node.TryAddAllocation(allocation))
 	return allocation
 }

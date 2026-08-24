@@ -402,6 +402,7 @@ func (pc *PartitionContext) AddApplication(app *objects.Application) error {
 	// all is OK update the app and add it to the partition
 	app.SetQueue(queue)
 	app.SetTerminatedCallback(pc.moveTerminatedApp)
+	app.SetReservationReleasedCallback(pc.decReservationCount)
 	queue.AddApplication(app)
 	pc.applications[appID] = app
 	pc.appQueueMapping.AddAppQueueMapping(appID, queue)
@@ -418,7 +419,8 @@ func (pc *PartitionContext) removeApplication(appID string) []*objects.Allocatio
 		return nil
 	}
 	// Remove all asks and thus all reservations and pending resources (queue included)
-	_ = app.RemoveAllocationAsk("")
+	released := app.RemoveAllocationAsk("")
+	pc.decReservationCount(released)
 	// Remove app from queue
 	if queue := app.GetQueue(); queue != nil {
 		queue.RemoveApplication(app)
@@ -1164,10 +1166,10 @@ func (pc *PartitionContext) GetNodes() []*objects.Node {
 // UpdateAllocation adds or updates an Allocation. If the Allocation has no NodeID specified, it is considered a
 // pending allocation and processed appropriate. This call is idempotent, and can be called multiple times with the
 // same allocation (such as on change updates from the shim)
-// Upon successfully processing, two flags are returned: requestCreated (if a new request was added) and allocCreated (if an allocation was satisifed).
+// Upon successfully processing, two flags are returned: requestCreated (if a new request was added) and allocCreated (if an allocation was satisfied).
 // This can be used by callers that need this information to take further action.
 // NOTE: this is a lock free call. It must NOT be called holding the PartitionContext lock.
-func (pc *PartitionContext) UpdateAllocation(alloc *objects.Allocation) (requestCreated bool, allocCreated bool, err error) { //nolint:funlen
+func (pc *PartitionContext) UpdateAllocation(alloc *objects.Allocation) (bool, bool, error) { //nolint:funlen
 	// cannot do anything with a nil alloc, should only happen if the shim broke things badly
 	if alloc == nil {
 		return false, false, nil
@@ -1348,7 +1350,7 @@ func (pc *PartitionContext) UpdateAllocation(alloc *objects.Allocation) (request
 	return false, false, nil
 }
 
-func (pc *PartitionContext) handleForeignAllocation(allocationKey, applicationID, nodeID string, node *objects.Node, alloc *objects.Allocation) (requestCreated bool, allocCreated bool, err error) {
+func (pc *PartitionContext) handleForeignAllocation(allocationKey, applicationID, nodeID string, node *objects.Node, alloc *objects.Allocation) (bool, bool, error) {
 	allocated := alloc.IsAllocated()
 	if !allocated {
 		return false, false, fmt.Errorf("trying to add a foreign request (non-allocation) %s", allocationKey)
@@ -1580,7 +1582,8 @@ func (pc *PartitionContext) removeAllocation(release *si.AllocationRelease) ([]*
 
 	if release.TerminationType != si.TerminationType_TIMEOUT {
 		// handle ask releases as well
-		_ = app.RemoveAllocationAsk(allocationKey)
+		released := app.RemoveAllocationAsk(allocationKey)
+		pc.decReservationCount(released)
 	}
 
 	return released, confirmed
